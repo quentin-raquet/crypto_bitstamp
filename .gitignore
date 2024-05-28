@@ -1,6 +1,6 @@
 # .gitignore for Python projects
 
-/export
+/outputs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

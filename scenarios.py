@@ -5,12 +5,14 @@ from datetime import datetime
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+import hydra
+import logging
+from omegaconf import DictConfig
 from chronos import ChronosPipeline
 from utils import get_history, generate_time_intervals, str_to_datetime
 from api_client import BitstampClient
 from typing import Any, Dict, List
 from torch import Tensor
-import yaml
 
 from torchmetrics.functional import (
     mean_absolute_error,
@@ -18,6 +20,8 @@ from torchmetrics.functional import (
     mean_absolute_percentage_error,
     r2_score,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_ohlc_df(
@@ -42,6 +46,7 @@ def get_ohlc_df(
     Returns:
         The OHLC data as a pandas DataFrame.
     """
+    logger.info(f"Retrieve OHLC data from client: {curr_symb} from {start_date} to {end_date}")
     intervals = generate_time_intervals(start_date, end_date, step_sec, max_res)
 
     columns = ["timestamp", "open", "high", "low", "close", "volume", "datetime"]
@@ -55,6 +60,7 @@ def get_ohlc_df(
                     client,
                     curr_symb,
                     step_sec=step_sec,
+                    limit=max_res,
                     start_dt=start_dt,
                     end_dt=end_dt,
                 ),
@@ -77,6 +83,7 @@ def build_context(ohlc_df: pd.DataFrame, context_len: int, cols: List[str]) -> T
     Returns:
         The context tensor.
     """
+    logger.info("Build context tensor for model")
     output_len = len(ohlc_df) - context_len
     context = np.empty((output_len, len(cols), context_len))
     for i in tqdm(range(context_len, len(ohlc_df) - 1)):
@@ -110,6 +117,7 @@ def predict_prices(context: Tensor, model_name: str, num_samples: int = 5) -> Te
     Returns:
         The predicted prices tensor.
     """
+    logger.info("Predict prices using trained model")
     pipeline = ChronosPipeline.from_pretrained(
         model_name,
         device_map="cpu",  # use "cpu" for CPU inference or "cuda"
@@ -126,12 +134,14 @@ def predict_prices(context: Tensor, model_name: str, num_samples: int = 5) -> Te
             forecast = forecast.unsqueeze(0)
         mean = forecast[0, :].mean().item()
         std = forecast[0, :].std().item()
-        try:
-            predictions[i, 0] = mean
-            predictions[i, 1] = std
-        except RuntimeError:
-            predictions[i, 0] = np.nan
-            predictions[i, 1] = np.nan
+        if abs(mean) > 1e100:
+            mean = 0.0
+            logger.warning("Mean is too large")
+        if abs(std) < 1e-6:
+            logger.warning("Std is too small")
+        predictions[i, 0] = mean
+        predictions[i, 1] = std
+
     return predictions
 
 
@@ -153,6 +163,7 @@ def compute_metrics(preds: Tensor, targets: Tensor) -> Dict[str, float]:
         "MAPE": mean_absolute_percentage_error(preds, targets).item(),
         "R2": r2_score(preds, targets).item(),
     }
+    logger.info("Metrics computed")
     return metrics
 
 
@@ -178,9 +189,7 @@ def build_output(
     return output
 
 
-def export_results(
-    output_folder: str, output_df: pd.DataFrame, metrics: Dict[str, float], config: Dict[str, Any]
-) -> None:
+def export_results(output_folder: str, output_df: pd.DataFrame, metrics: Dict[str, float]) -> None:
     """
     Exports the results to the specified output folder.
 
@@ -188,53 +197,61 @@ def export_results(
         output_folder: The output folder path.
         output_df: The output DataFrame.
         metrics: The computed metrics.
-        config: The configuration dictionary.
     """
+    logger.info("Export results to output folder")
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     output_df.to_csv(output_folder + "/output.csv")
     with open(output_folder + "/metrics.yml", "w") as f:
         yaml.dump(metrics, f)
-    with open(output_folder + "/config.yml", "w") as f:
-        yaml.dump(config, f)
 
 
-def main(client: BitstampClient, config: Dict[str, Any]) -> None:
+def validate_config(config: Dict[str, Any]) -> None:
+    assert config.api.start_date < config.api.end_date, "Start date must be before end date"
+    assert config.model.context_len > 0, "Context length must be greater than 0"
+    assert config.api.step_sec > 0, "Step seconds must be greater than 0"
+    limit = (
+        str_to_datetime(config.api.end_date) - str_to_datetime(config.api.start_date)
+    ).total_seconds() / config.api.step_sec
+    assert config.model.context_len < limit, "Context length must be less than max resolution"
+    logger.info("Config validated")
+
+
+@hydra.main(version_base=None, config_path=".", config_name="config")
+def main(config: DictConfig) -> None:
     """
     The main function that orchestrates the data retrieval, model prediction, and result export.
 
     Args:
-        client: The Bitstamp client.
         config: The configuration dictionary.
     """
-    start_date = str_to_datetime(config["start_date"])
-    end_date = str_to_datetime(config["end_date"])
+    validate_config(config)
+    api_key = os.getenv("BITSTAMP_API_KEY")
+    api_secret = os.getenv("BITSTAMP_API_SECRET")
+    client = BitstampClient(api_key, api_secret)
+    start_date = str_to_datetime(config.api.start_date)
+    end_date = str_to_datetime(config.api.end_date)
     ohlc_df = get_ohlc_df(
         client,
         start_date,
         end_date,
-        config["step_sec"],
-        config["max_res"],
-        config["curr_symb"],
+        config.api.step_sec,
+        config.api.max_res,
+        config.api.curr_symb,
     )
-    context = build_context(ohlc_df, config["context_len"], config["cols"])
-    targets = build_target(ohlc_df, config["context_len"])
-    predictions = predict_prices(context, config["model_name"])
-    output_df = build_output(ohlc_df, config["context_len"], predictions, targets)
+    context = build_context(ohlc_df, config.model.context_len, config.model.cols)
+    targets = build_target(ohlc_df, config.model.context_len)
+    predictions = predict_prices(context, config.model.model_name)
+    output_df = build_output(ohlc_df, config.model.context_len, predictions, targets)
     metrics = compute_metrics(predictions[:, 0], targets)
+    output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     export_results(
-        f"export/{config['curr_symb']}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}",
+        f"{output_dir}/{config.api.curr_symb}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}",
         output_df,
         metrics,
-        config,
     )
     return
 
 
 if __name__ == "__main__":
-    with open("config.yml", "r") as f:
-        config = yaml.safe_load(f)
-    api_key = os.getenv("BITSTAMP_API_KEY")
-    api_secret = os.getenv("BITSTAMP_API_SECRET")
-    client = BitstampClient(api_key, api_secret)
-    main(client, config)
+    main()

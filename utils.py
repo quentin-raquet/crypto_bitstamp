@@ -21,18 +21,19 @@ def generate_time_intervals(start_date, end_date, step_sec, max_res):
     current_dt = start_date
     while current_dt < end_date:
         start_dt = current_dt
-        end_dt = start_dt + timedelta(seconds=step_sec * max_res)
+        end_dt = min(start_dt + timedelta(seconds=step_sec * max_res), end_date)
         intervals.append((start_dt, end_dt))
         current_dt = end_dt
     return intervals
 
 
-def get_history(client, market_symbol, step_sec, start_dt, end_dt):
+def get_history(client, market_symbol, step_sec, limit, start_dt, end_dt):
+    limit = min((end_dt - start_dt) / timedelta(seconds=step_sec), limit)
     data = client.get(
         f"ohlc/{market_symbol}/",
         {
             "step": int(step_sec),
-            "limit": 1000,
+            "limit": int(limit),
             "start": datetime_to_timestamp(start_dt),
             "end": datetime_to_timestamp(end_dt),
         },
