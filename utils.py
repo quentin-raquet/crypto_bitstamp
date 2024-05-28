@@ -1,8 +1,16 @@
 import warnings
-from datetime import timedelta
+from datetime import timedelta, datetime
 import pandas as pd
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+def str_to_datetime(date_str):
+    if date_str is None:
+        return datetime.today()
+    date_format = "%Y-%m-%d"
+    return datetime.strptime(date_str, date_format)
+
 
 def datetime_to_timestamp(dt):
     return int(dt.timestamp())

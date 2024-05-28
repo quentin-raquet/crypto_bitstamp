@@ -1,5 +1,7 @@
 # .gitignore for Python projects
 
+/export
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
