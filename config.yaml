@@ -1,11 +1,11 @@
 api:
-  curr_symb: btceur # "btceur", "etheur", "xrpeur", "ltceur", "bcheur", "xlmeur", "linkeur", "usdceur", "aaveeur"
+  curr_symb: btceur # "btceur", "etheur", "ltceur", "bcheur", "xlmeur", "linkeur", "usdceur", "aaveeur"
   start_date: "2024-01-01"
-  end_date: "2024-02-01"
+  end_date: "2024-04-01"
   step_sec: 3600 # 1 hour
   max_res: 1000
 model:
-  model_name: "amazon/chronos-t5-small" #tiny, small, base, large, huge
+  model_name: "amazon/chronos-t5-base" #tiny, small, base, large, huge
   context_len: 24
   num_samples: 5
   cols: ["close"] # "open", "high", "low", "close", "volume"

@@ -1,17 +1,16 @@
 import os
 import yaml
 import torch
-from datetime import datetime
 from tqdm import tqdm
-import numpy as np
 import pandas as pd
 import hydra
 import logging
 from omegaconf import DictConfig
 from chronos import ChronosPipeline
-from utils import get_history, generate_time_intervals, str_to_datetime
+from utils import str_to_datetime
 from api_client import BitstampClient
-from typing import Any, Dict, List
+from model.data import get_ohlc_df, build_context, build_target
+from typing import Any, Dict
 from torch import Tensor
 
 from torchmetrics.functional import (
@@ -22,87 +21,6 @@ from torchmetrics.functional import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def get_ohlc_df(
-    client: BitstampClient,
-    start_date: datetime,
-    end_date: datetime,
-    step_sec: int,
-    max_res: int,
-    curr_symb: str,
-) -> pd.DataFrame:
-    """
-    Retrieves OHLC (Open-High-Low-Close) data from the client for the specified time range.
-
-    Args:
-        client: The Bitstamp client.
-        start_date: The start date of the data range.
-        end_date: The end date of the data range.
-        step_sec: The time interval in seconds.
-        max_res: The maximum number of data points to retrieve.
-        curr_symb: The currency symbol.
-
-    Returns:
-        The OHLC data as a pandas DataFrame.
-    """
-    logger.info(f"Retrieve OHLC data from client: {curr_symb} from {start_date} to {end_date}")
-    intervals = generate_time_intervals(start_date, end_date, step_sec, max_res)
-
-    columns = ["timestamp", "open", "high", "low", "close", "volume", "datetime"]
-    ohlc_df = pd.DataFrame({}, columns=columns).reindex(columns=columns)
-
-    for start_dt, end_dt in tqdm(intervals):
-        ohlc_df = pd.concat(
-            [
-                ohlc_df,
-                get_history(
-                    client,
-                    curr_symb,
-                    step_sec=step_sec,
-                    limit=max_res,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                ),
-            ],
-            ignore_index=True,
-        )
-
-    return ohlc_df
-
-
-def build_context(ohlc_df: pd.DataFrame, context_len: int, cols: List[str]) -> Tensor:
-    """
-    Builds the context tensor for the model.
-
-    Args:
-        ohlc_df: The OHLC data as a pandas DataFrame.
-        context_len: The length of the context.
-        cols: The columns to include in the context.
-
-    Returns:
-        The context tensor.
-    """
-    logger.info("Build context tensor for model")
-    output_len = len(ohlc_df) - context_len
-    context = np.empty((output_len, len(cols), context_len))
-    for i in tqdm(range(context_len, len(ohlc_df) - 1)):
-        context[i - context_len] = ohlc_df.loc[(i - context_len) : (i - 1), cols].values.T
-    return torch.tensor(context)
-
-
-def build_target(ohlc_df: pd.DataFrame, context_len: int) -> Tensor:
-    """
-    Builds the target tensor for the model.
-
-    Args:
-        ohlc_df: The OHLC data as a pandas DataFrame.
-        context_len: The length of the context.
-
-    Returns:
-        The target tensor.
-    """
-    return torch.tensor(ohlc_df.loc[context_len:, "close"].values)
 
 
 def predict_prices(context: Tensor, model_name: str, num_samples: int = 5) -> Tensor:
