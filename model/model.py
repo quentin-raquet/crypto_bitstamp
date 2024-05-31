@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from pytorch_lightning import LightningModule
+from torchmetrics.functional import mean_absolute_percentage_error
 
 
 class TemporalConvNet(nn.Module):
@@ -36,7 +37,7 @@ class TemporalBlock(nn.Module):
         self, in_channels, out_channels, kernel_size, stride, dilation, padding, dropout=0.2
     ):
         super(TemporalBlock, self).__init__()
-        self.conv1 = weight_norm(
+        self.conv1 = nn.utils.parametrizations.weight_norm(
             nn.Conv1d(
                 in_channels,
                 out_channels,
@@ -50,7 +51,7 @@ class TemporalBlock(nn.Module):
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
-        self.conv2 = weight_norm(
+        self.conv2 = nn.utils.parametrizations.weight_norm(
             nn.Conv1d(
                 out_channels,
                 out_channels,
@@ -101,57 +102,53 @@ class Chomp1d(nn.Module):
         return x[:, :, : -self.chomp_size].contiguous()
 
 
-def weight_norm(module):
-    return nn.utils.weight_norm(module)
-
-
-class OrderBookModule(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(OrderBookModule, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
-
-
 class TimeSeriesPredictionModel(LightningModule):
     def __init__(
         self,
         num_inputs,
         num_channels,
+        num_outputs,
         kernel_size,
+        dropout,
         learning_rate,
-        batch_size,
-        order_book_input_size,
-        order_book_hidden_size,
-        order_book_output_size,
+        min_y,
+        max_y,
     ):
         super(TimeSeriesPredictionModel, self).__init__()
-        self.tcn = TemporalConvNet(num_inputs, num_channels, kernel_size)
-        self.order_book_module = OrderBookModule(
-            order_book_input_size, order_book_hidden_size, order_book_output_size
-        )
-        self.linear = nn.Linear(
-            num_channels[-1] + order_book_output_size, 2
-        )  # 2 outputs for BTC/EUR and ETH/EUR
+        self.tcn = TemporalConvNet(num_inputs, num_channels, kernel_size, dropout)
+        self.linear = nn.Linear(num_channels[-1], num_outputs)  # 2 outputs for BTC/EUR and ETH/EUR
         self.learning_rate = learning_rate
-        self.batch_size = batch_size
+        self.min_y = torch.tensor(min_y, dtype=torch.float32)
+        self.max_y = torch.tensor(max_y, dtype=torch.float32)
 
-    def forward(self, x_tcn, x_order_book):
-        y1 = self.tcn(x_tcn)
-        y2 = self.order_book_module(x_order_book)
-        y = torch.cat((y1[:, :, -1], y2), dim=1)
-        return self.linear(y)
+    def forward(self, x_tcn):
+        y = self.tcn(x_tcn)
+        return self.linear(y[:, :, -1])
 
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
         loss = F.mse_loss(y_hat, y)
+        y_hat_unscaled = self.unscale_y(y_hat)
+        y_unscaled = self.unscale_y(y)
+        mape = mean_absolute_percentage_error(y_hat_unscaled, y_unscaled)
+        self.log("train_loss", loss, on_step=False, on_epoch=True)
+        self.log("train_mape", mape, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.mse_loss(y_hat, y)
+        y_hat_unscaled = self.unscale_y(y_hat)
+        y_unscaled = self.unscale_y(y)
+        mape = mean_absolute_percentage_error(y_hat_unscaled, y_unscaled)
+        self.log("val_loss", loss, on_step=False, on_epoch=True)
+        self.log("val_mape", mape, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
+    def unscale_y(self, y):
+        return y * (self.max_y - self.min_y) + self.min_y

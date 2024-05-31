@@ -4,15 +4,18 @@ from datetime import datetime
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+import wandb
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 from pytorch_lightning import LightningDataModule
+from torchmetrics.functional import mean_absolute_percentage_error
 from typing import List
 from api_client import BitstampClient
 from utils import get_history, generate_time_intervals, str_to_datetime
 
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +41,9 @@ def get_ohlc_df(
     Returns:
         The OHLC data as a pandas DataFrame.
     """
-    logger.info(f"Retrieve OHLC data from client: {curr_symb} from {start_date} to {end_date}")
+    logger.info(
+        f"Retrieve OHLC data from client: {curr_symb} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+    )
     intervals = generate_time_intervals(start_date, end_date, step_sec, max_res)
 
     columns = ["timestamp", "open", "high", "low", "close", "volume", "datetime"]
@@ -75,12 +80,12 @@ def build_context(ohlc_df: pd.DataFrame, context_len: int, cols: List[str]) -> T
     Returns:
         The context tensor.
     """
-    logger.info("Build context tensor for model")
+    logger.info(f"Build context tensor with cols: {cols}")
     output_len = len(ohlc_df) - context_len
     context = np.empty((output_len, len(cols), context_len))
     for i in tqdm(range(context_len, len(ohlc_df) - 1)):
         context[i - context_len] = ohlc_df.loc[(i - context_len) : (i - 1), cols].values.T
-    return torch.tensor(context)
+    return torch.tensor(context, dtype=torch.float32)
 
 
 def build_target(ohlc_df: pd.DataFrame, context_len: int) -> Tensor:
@@ -94,7 +99,7 @@ def build_target(ohlc_df: pd.DataFrame, context_len: int) -> Tensor:
     Returns:
         The target tensor.
     """
-    return torch.tensor(ohlc_df.loc[context_len:, "close"].values).unsqueeze(1)
+    return torch.tensor(ohlc_df.loc[context_len:, "close"].values, dtype=torch.float32).unsqueeze(1)
 
 
 class TimeSeriesDataModule(LightningDataModule):
@@ -110,6 +115,7 @@ class TimeSeriesDataModule(LightningDataModule):
         max_res=1000,
         batch_size=64,
         val_size=0.2,
+        num_workers=1,
     ):
         super(TimeSeriesDataModule, self).__init__()
 
@@ -125,22 +131,56 @@ class TimeSeriesDataModule(LightningDataModule):
                 X = torch.cat((X, context), dim=1)
                 y = torch.cat((y, target), dim=1)
 
-        self.split_data(X, y, val_size=val_size)
-        self.scale()
+        self.curr_symbs = curr_symbs
+        self.input_cols = input_cols
         self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        self.split_data(X, y, val_size=val_size)
+        self.compute_baseline_mape()
+        self.scale()
 
     def split_data(self, X, y, val_size: float):
         n = len(X)
-        n_val = int(n * val_size)
-        self.X_train, self.X_val = X[:n_val], X[:n_val]
-        self.y_train, self.y_val = y[:n_val], y[:n_val]
-        logger.info(f"Data split into training ({n-n_val}) and validation ({n_val}) sets")
+        n_train = int(n * (1 - val_size))
+        self.X_train, self.X_val = X[:n_train], X[n_train:]
+        self.y_train, self.y_val = y[:n_train], y[n_train:]
+        logger.info(f"Data split into training ({n_train}) and validation ({n - n_train}) sets")
+        wandb.config.update(
+            {
+                "train_size": n_train,
+                "valid_size": n - n_train,
+            }
+        )
+
+    def compute_baseline_mape(self):
+        y_hat = self.X_val[
+            :,
+            [i * len(self.input_cols) for i in range(len(self.curr_symbs))],
+            -1,
+        ]  # Predict last value of context
+        mape = mean_absolute_percentage_error(y_hat, self.y_val)
+        logger.info(f"Baseline MAPE: {mape}")
+        wandb.config.update(
+            {
+                "Baseline_MAPE": mape,
+            }
+        )
+        return mape
 
     def scale(self):
-        self.min_X = self.X_train.min(dim=0, keepdim=True).values
-        self.max_X = self.X_train.max(dim=0, keepdim=True).values
-        self.min_y = self.y_train.min(dim=0, keepdim=True).values
-        self.max_y = self.y_train.max(dim=0, keepdim=True).values
+        self.min_X = self.X_train.min(dim=0, keepdim=True).values.min(dim=2, keepdim=True).values
+        self.max_X = self.X_train.max(dim=0, keepdim=True).values.min(dim=2, keepdim=True).values
+        self.min_y = self.min_X[
+            :,
+            [i * len(self.input_cols) for i in range(len(self.curr_symbs))],
+            0,
+        ]
+        self.max_y = self.max_X[
+            :,
+            [i * len(self.input_cols) for i in range(len(self.curr_symbs))],
+            0,
+        ]
         self.X_train = (self.X_train - self.min_X) / (self.max_X - self.min_X)
         self.X_val = (self.X_val - self.min_X) / (self.max_X - self.min_X)
         self.y_train = (self.y_train - self.min_y) / (self.max_y - self.min_y)
@@ -152,10 +192,17 @@ class TimeSeriesDataModule(LightningDataModule):
         self.val_dataset = TensorDataset(self.X_val, self.y_val)
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size)
+        return DataLoader(
+            self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+        )
 
 
 if __name__ == "__main__":

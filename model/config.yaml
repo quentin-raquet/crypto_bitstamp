@@ -1,0 +1,20 @@
+output_dir: ./outputs/
+
+data:
+  curr_symbs: ["btceur", "etheur", "ltceur"]
+  input_cols: ["close", "volume"]
+  start_date: "2021-01-01"
+  end_date: "2024-05-30"
+  step_sec: 3600
+  max_res: 1000
+  batch_size: 64
+  val_size: 0.2
+  num_workers: 7
+
+model:
+  num_channels: [32, 32, 16, 16]
+  kernel_size: 3
+  dropout: 0.3
+  learning_rate: 0.001
+  max_epochs: 120
+  patience: 10
